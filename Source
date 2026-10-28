@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+Sort Lab: how efficient are quicksort and radix sort, really?
+
+Compares four quicksort variants, two radix sort settings and Python's built-in
+sort (Timsort) on different kinds of input, and measures:
+  * running time and how it grows with input size (empirical complexity)
+  * comparisons and element moves (operation counts)
+  * the effect of input shape (random, sorted, reversed, nearly sorted, few unique)
+  * the effect of key size (radix sort depends on it, quicksort does not)
+
+Run:      python sort_lab.py
+Faster:   python sort_lab.py --quick
+Options:  python sort_lab.py --max-n 128000 --repeats 5 --budget 3
+Plots need matplotlib (pip install matplotlib); everything else is standard library.
+"""
+import argparse, csv, math, os, random, time
+
+KEY_MAX = 10**9  # keys are integers in [0, KEY_MAX)
+
+
+# ---------------------------------------------------------------- algorithms
+def quicksort(a, pivot, rng):
+    """In-place iterative quicksort. Returns (comparisons, moves).
+
+    pivot: "first"   Lomuto partition, first element as pivot (naive)
+           "random"  Lomuto partition, random pivot
+           "median3" Lomuto partition, median of first/middle/last
+           "3way"    random pivot, three-way partition (handles duplicates well)
+    The larger half is pushed on a stack and the smaller half is processed first,
+    so the stack never grows beyond log2(n) entries, even on bad inputs.
+    """
+    cmp = mov = 0
+    stack = [(0, len(a) - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        while lo < hi:
+            if pivot == "first":
+                p = lo
+            elif pivot == "median3":
+                mid = (lo + hi) // 2
+                p = sorted((lo, mid, hi), key=a.__getitem__)[1]
+                cmp += 3
+            else:
+                p = rng.randint(lo, hi)
+
+            if pivot == "3way":
+                a[lo], a[p] = a[p], a[lo]
+                v = a[lo]
+                lt, i, gt = lo, lo + 1, hi
+                while i <= gt:
+                    cmp += 1
+                    if a[i] < v:
+                        a[lt], a[i] = a[i], a[lt]; lt += 1; i += 1; mov += 1
+                    else:
+                        cmp += 1
+                        if a[i] > v:
+                            a[i], a[gt] = a[gt], a[i]; gt -= 1; mov += 1
+                        else:
+                            i += 1
+                left, right = (lo, lt - 1), (gt + 1, hi)
+            else:
+                a[p], a[hi] = a[hi], a[p]
+                v, i = a[hi], lo
+                for j in range(lo, hi):
+                    cmp += 1
+                    if a[j] < v:
+                        a[i], a[j] = a[j], a[i]; i += 1; mov += 1
+                a[i], a[hi] = a[hi], a[i]; mov += 1
+                left, right = (lo, i - 1), (i + 1, hi)
+
+            (l1, h1), (l2, h2) = left, right
+            if h1 - l1 < h2 - l2:
+                stack.append((l2, h2)); lo, hi = l1, h1
+            else:
+                stack.append((l1, h1)); lo, hi = l2, h2
+    return cmp, mov
+
+
+def radix_sort(a, bits):
+    """LSD radix sort for non-negative integers using `bits` bits per pass.
+    Returns (0 comparisons, element moves). Moves = n * passes: no comparisons at all."""
+    if not a:
+        return 0, 0
+    mask, shift, biggest, moves = (1 << bits) - 1, 0, max(a), 0
+    while True:
+        buckets = [[] for _ in range(mask + 1)]
+        for x in a:
+            buckets[(x >> shift) & mask].append(x)
+        a[:] = [x for b in buckets for x in b]
+        moves += len(a)
+        shift += bits
+        if (biggest >> shift) == 0:
+            return 0, moves
+
+
+def builtin(a, rng):
+    a.sort()
+    return 0, 0
+
+
+ALGOS = {
+    "quick-first":   lambda a, r: quicksort(a, "first", r),
+    "quick-random":  lambda a, r: quicksort(a, "random", r),
+    "quick-median3": lambda a, r: quicksort(a, "median3", r),
+    "quick-3way":    lambda a, r: quicksort(a, "3way", r),
+    "radix-8bit":    lambda a, r: radix_sort(a, 8),
+    "radix-16bit":   lambda a, r: radix_sort(a, 16),
+    "timsort":       builtin,
+}
+
+
+# ---------------------------------------------------------------- test data
+def make_data(kind, n, rng):
+    a = [rng.randrange(KEY_MAX) for _ in range(n)]
+    if kind == "sorted":
+        a.sort()
+    elif kind == "reversed":
+        a.sort(reverse=True)
+    elif kind == "nearly_sorted":          # sorted, then 1% of positions swapped
+        a.sort()
+        for _ in range(max(1, n // 100)):
+            i, j = rng.randrange(n), rng.randrange(n)
+            a[i], a[j] = a[j], a[i]
+    elif kind == "few_unique":             # only 10 distinct values
+        a = [rng.randrange(10) * (KEY_MAX // 10) for _ in range(n)]
+    return a
+
+
+DISTS = ["random", "sorted", "reversed", "nearly_sorted", "few_unique"]
+
+
+# ---------------------------------------------------------------- measuring
+def measure(fn, data, repeats, rng):
+    """Best-of-N time. Every result is checked against Python's sorted()."""
+    expected = sorted(data)
+    best, stats = float("inf"), (0, 0)
+    for _ in range(repeats):
+        a = data[:]
+        t = time.perf_counter()
+        stats = fn(a, rng)
+        dt = time.perf_counter() - t
+        assert a == expected, "sorting result is wrong!"
+        best = min(best, dt)
+        if dt > 0.5:       # slow case: one run is enough
+            break
+    return best, stats
+
+
+def loglog_slope(ns, ts):
+    """Least-squares slope of log(time) vs log(n): ~1.0-1.2 means n log n, ~2 means n squared."""
+    pts = [(math.log(n), math.log(t)) for n, t in zip(ns, ts) if t and t > 0]
+    if len(pts) < 3:
+        return float("nan")
+    mx = sum(x for x, _ in pts) / len(pts)
+    my = sum(y for _, y in pts) / len(pts)
+    return sum((x - mx) * (y - my) for x, y in pts) / sum((x - mx) ** 2 for x, _ in pts)
+
+
+# ---------------------------------------------------------------- experiments
+def scaling_experiment(sizes, repeats, budget, rng):
+    rows, dead = [], set()
+    for dist in DISTS:
+        print(f"\n  input: {dist}")
+        for n in sizes:
+            data = make_data(dist, n, rng)
+            line = f"    n={n:>8,}  "
+            for name, fn in ALGOS.items():
+                if (dist, name) in dead:
+                    continue
+                t, (c, m) = measure(fn, data, repeats, rng)
+                rows.append(dict(dist=dist, algo=name, n=n, seconds=t, comparisons=c, moves=m))
+                line += f"{name}={t*1000:,.1f}ms  "
+                if t > budget:
+                    dead.add((dist, name))   # too slow: skip larger sizes
+                    line += "(!) "
+            print(line)
+    return rows
+
+
+def keywidth_experiment(n, repeats, rng):
+    """Radix sort needs more passes as keys get longer; quicksort does not care."""
+    print(f"\n  n = {n:,} random integers, growing key size")
+    rows = []
+    for bits in (8, 16, 24, 32, 48, 64, 96, 128):
+        data = [rng.getrandbits(bits) for _ in range(n)]
+        line = f"    {bits:>3}-bit keys  "
+        for name in ("radix-8bit", "radix-16bit", "quick-random", "timsort"):
+            t, _ = measure(ALGOS[name], data, repeats, rng)
+            rows.append(dict(bits=bits, algo=name, seconds=t))
+            line += f"{name}={t*1000:,.1f}ms  "
+        print(line)
+    return rows
+
+
+# ---------------------------------------------------------------- reporting
+def report(rows, sizes):
+    print("\n" + "=" * 72 + "\nANALYSIS\n" + "=" * 72)
+
+    print("\n1) Empirical growth exponent on random data (time ~ n^k)")
+    print("   k near 1.0-1.2 = n log n behaviour, k near 2 = quadratic\n")
+    for name in ALGOS:
+        r = [x for x in rows if x["dist"] == "random" and x["algo"] == name]
+        k = loglog_slope([x["n"] for x in r], [x["seconds"] for x in r])
+        print(f"   {name:<14} k = {k:.2f}")
+
+    print("\n2) Time per element, in nanoseconds per (n * log2 n), random data")
+    print("   If a column stays flat as n grows, the algorithm really is n log n\n")
+    print("   " + f"{'':<14}" + "".join(f"{n:>10,}" for n in sizes))
+    for name in ALGOS:
+        cells = ""
+        for n in sizes:
+            x = [r for r in rows if r["dist"] == "random" and r["algo"] == name and r["n"] == n]
+            cells += f"{x[0]['seconds'] / (n * math.log2(n)) * 1e9:>10.1f}" if x else f"{'-':>10}"
+        print(f"   {name:<14}{cells}")
+
+    n = max(sizes)
+    print(f"\n3) Operation counts at n = {n:,} (random data)")
+    print(f"   {'algorithm':<14}{'comparisons':>14}{'moves':>14}{'cmp/(n log2 n)':>16}")
+    for name in ALGOS:
+        x = [r for r in rows if r["dist"] == "random" and r["algo"] == name and r["n"] == n]
+        if x:
+            c = x[0]["comparisons"]
+            print(f"   {name:<14}{c:>14,}{x[0]['moves']:>14,}{c / (n * math.log2(n)):>16.2f}")
+
+    print("\n4) Effect of input shape (time in ms at the largest size every algorithm finished)")
+    common = max(s for s in sizes if all(any(r["dist"] == d and r["algo"] == a and r["n"] == s for r in rows)
+                                         for d in DISTS for a in ALGOS)) if any(
+        all(any(r["dist"] == d and r["algo"] == a and r["n"] == s for r in rows) for d in DISTS for a in ALGOS)
+        for s in sizes) else min(sizes)
+    print(f"   n = {common:,}\n")
+    print("   " + f"{'':<14}" + "".join(f"{d:>15}" for d in DISTS))
+    for name in ALGOS:
+        cells = ""
+        for d in DISTS:
+            x = [r for r in rows if r["dist"] == d and r["algo"] == name and r["n"] == common]
+            cells += f"{x[0]['seconds']*1000:>15.1f}" if x else f"{'skipped':>15}"
+        print(f"   {name:<14}{cells}")
+    skipped = [(d, a) for d in DISTS for a in ALGOS
+               if not any(r["dist"] == d and r["algo"] == a and r["n"] == max(sizes) for r in rows)]
+    if skipped:
+        print("\n   Stopped early because they exceeded the time budget (likely O(n^2)):")
+        for d, a in skipped:
+            print(f"     {a} on {d} data")
+
+
+def plots(rows, kw_rows, sizes, outdir):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("\n(matplotlib not installed, skipping plots: pip install matplotlib)")
+        return
+    # 1: growth on random data
+    plt.figure(figsize=(8, 5))
+    for name in ALGOS:
+        r = [x for x in rows if x["dist"] == "random" and x["algo"] == name]
+        plt.plot([x["n"] for x in r], [x["seconds"] for x in r], marker="o", label=name)
+    plt.xscale("log"); plt.yscale("log")
+    plt.xlabel("input size n"); plt.ylabel("time (s)"); plt.title("Running time on random data")
+    plt.grid(True, which="both", alpha=.3); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "growth_random.png"), dpi=140); plt.close()
+    # 2: input shapes at fixed n
+    n = sizes[len(sizes) // 2]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    w = 0.8 / len(ALGOS)
+    for i, name in enumerate(ALGOS):
+        vals = []
+        for d in DISTS:
+            x = [r for r in rows if r["dist"] == d and r["algo"] == name and r["n"] == n]
+            vals.append(x[0]["seconds"] if x else float("nan"))
+        ax.bar([j + i * w for j in range(len(DISTS))], vals, w, label=name)
+    ax.set_xticks([j + 0.4 - w / 2 for j in range(len(DISTS))]); ax.set_xticklabels(DISTS)
+    ax.set_yscale("log"); ax.set_ylabel("time (s)"); ax.set_title(f"Effect of input shape (n = {n:,})")
+    ax.legend(fontsize=8); plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "input_shapes.png"), dpi=140); plt.close()
+    # 3: key width
+    plt.figure(figsize=(8, 5))
+    for name in ("radix-8bit", "radix-16bit", "quick-random", "timsort"):
+        r = [x for x in kw_rows if x["algo"] == name]
+        plt.plot([x["bits"] for x in r], [x["seconds"] for x in r], marker="o", label=name)
+    plt.xlabel("key size (bits)"); plt.ylabel("time (s)")
+    plt.title("Radix sort slows as keys get longer; quicksort barely notices")
+    plt.grid(True, alpha=.3); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "key_width.png"), dpi=140); plt.close()
+    print(f"\nPlots saved in {outdir}/")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--max-n", type=int, default=64000, help="largest input size (default 64000)")
+    ap.add_argument("--repeats", type=int, default=3, help="runs per measurement, best is kept")
+    ap.add_argument("--budget", type=float, default=1.5, help="stop an algorithm on an input type once one run exceeds this many seconds")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out", default="results")
+    ap.add_argument("--quick", action="store_true", help="small, fast run")
+    ap.add_argument("--no-plots", action="store_true")
+    args = ap.parse_args()
+    if args.quick:
+        args.max_n, args.repeats = 16000, 2
+
+    rng = random.Random(args.seed)
+    os.makedirs(args.out, exist_ok=True)
+    sizes, n = [], 1000
+    while n <= args.max_n:
+        sizes.append(n); n *= 2
+
+    print("SORT LAB  (times are best-of-%d, every result is verified against sorted())" % args.repeats)
+    print("\nEXPERIMENT 1: how time grows with input size and input shape")
+    rows = scaling_experiment(sizes, args.repeats, args.budget, rng)
+    print("\nEXPERIMENT 2: effect of key size")
+    kw_rows = keywidth_experiment(min(args.max_n, 30000), args.repeats, rng)
+
+    report(rows, sizes)
+
+    with open(os.path.join(args.out, "scaling.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["dist", "algo", "n", "seconds", "comparisons", "moves"])
+        w.writeheader(); w.writerows(rows)
+    with open(os.path.join(args.out, "key_width.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["bits", "algo", "seconds"])
+        w.writeheader(); w.writerows(kw_rows)
+    print(f"\nRaw data saved in {args.out}/scaling.csv and key_width.csv")
+    if not args.no_plots:
+        plots(rows, kw_rows, sizes, args.out)
+
+
+if __name__ == "__main__":
+    main()
